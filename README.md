@@ -57,3 +57,10 @@ Limona and its child processes before replacing or removing application files.
 The installer registers the existing Windows startup behavior; uninstalling
 removes that startup entry and application files while preserving user settings
 and data under `%LOCALAPPDATA%\Limona`.
+
+## License
+
+Original Limona source code authored by Mohamed Baroudi is licensed under the
+MIT License; see [LICENSE](LICENSE). Third-party fonts, icons, and other bundled
+assets are excluded from this license and remain under their respective
+licenses.
