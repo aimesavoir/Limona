@@ -1,0 +1,13 @@
+bin/
+obj/
+*.user
+*.suo
+.vs/
+*.log
+.idea/
+artifacts/
+TestResults/
+*.csproj.user
+*.sln.docstates
+Thumbs.db
+.DS_Store
