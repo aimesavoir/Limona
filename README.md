@@ -9,6 +9,11 @@ self-contained. The per-user installer supports 64-bit Windows 10 (version
 1809/build 17763 or newer) and Windows 11; it does not require administrator
 rights or a separately installed .NET runtime.
 
+## Download
+
+[Download Limona Setup for Windows](https://github.com/aimesavoir/Limona/releases/latest/download/Limona-Setup-1.0.0.0.exe)
+from the latest GitHub Release.
+
 ## Build
 
 Run from the repository root in PowerShell with the .NET 9 SDK and Windows App
