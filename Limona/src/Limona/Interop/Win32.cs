@@ -170,13 +170,25 @@ internal static class Win32
     public static extern int CoInitializeEx(IntPtr pvReserved, uint dwCoInit);
     public const uint COINIT_APARTMENTTHREADED = 0x2;
 
-    // Shell change notifications: SHCNE_UPDATEDIR + SHCNF_PATHW (string item).
-    public const int SHCNE_UPDATEDIR = unchecked((int)0x08000000);
-    public const int SHCNE_UPDATEIMAGE = unchecked((int)0x08004000);
-    public const int SHCNE_RENAMEFOLDER = unchecked((int)0x02000000);
+    // Shell change notification event IDs
+    public const int SHCNE_RENAMEITEM = 0x00000001;
+    public const int SHCNE_ATTRIBUTES = 0x00000800;
+    public const int SHCNE_UPDATEDIR = 0x00001000;
+    public const int SHCNE_UPDATEITEM = 0x00002000;
+    public const int SHCNE_UPDATEIMAGE = 0x00008000;
+    public const int SHCNE_RENAMEFOLDER = 0x00020000;
+    public const int SHCNE_ASSOCCHANGED = 0x08000000;
+
+    // Shell change notification flags
     public const uint SHCNF_IDLIST = 0x0000;
+    public const uint SHCNF_DWORD = 0x0003;
     public const uint SHCNF_PATHW = 0x0005;
     public const uint SHCNF_FLUSH = 0x1000;
+    public const uint SHCNF_FLUSHNOWAIT = 0x2000;
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool WritePrivateProfileStringW(string? lpAppName, string? lpKeyName, string? lpString, string? lpFileName);
 
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
     private static extern void SHChangeNotify(int wEventId, uint uFlags, string? byrefItem, IntPtr dwItem2);
@@ -184,43 +196,277 @@ internal static class Win32
     [DllImport("shell32.dll", EntryPoint = "SHChangeNotify")]
     private static extern void SHChangeNotifyPidl(int wEventId, uint uFlags, IntPtr dwItem1, IntPtr dwItem2);
 
+    [DllImport("shell32.dll", EntryPoint = "SHChangeNotify")]
+    private static extern void SHChangeNotifyDword(int wEventId, uint uFlags, IntPtr dwItem1, IntPtr dwItem2);
+
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
     private static extern IntPtr SHSimpleIDListFromPath(string path);
 
     [DllImport("shell32.dll")]
     private static extern void ILFree(IntPtr pidl);
 
+    [DllImport("shlwapi.dll", EntryPoint = "PathMakeSystemFolderW", CharSet = CharSet.Unicode)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool PathMakeSystemFolder(string folderPath);
+
+    [DllImport("shlwapi.dll", EntryPoint = "PathUnmakeSystemFolderW", CharSet = CharSet.Unicode)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool PathUnmakeSystemFolder(string folderPath);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct SHFOLDERCUSTOMSETTINGS
+    {
+        public uint dwSize;
+        public uint dwMask;
+        public IntPtr pvid;
+        public string? pszWebViewTemplate;
+        public uint cchWebViewTemplate;
+        public string? pszWebViewTemplateVersion;
+        public string? pszInfoTip;
+        public uint cchInfoTip;
+        public IntPtr pclsid;
+        public uint dwFlags;
+        public string? pszIconFile;
+        public uint cchIconFile;
+        public int iIconIndex;
+        public string? pszLogo;
+        public uint cchLogo;
+    }
+
+    public const uint FCSM_ICONFILE = 0x00000010;
+    public const uint FCS_FORCEWRITE = 0x00000002;
+
+    /// <summary>
+    /// The exact shell32.dll API that the Windows Explorer Properties dialog calls when customizing a folder.
+    /// Handles desktop.ini formatting, volume-specific folder attributes, and shell icon cache invalidation natively.
+    /// </summary>
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern int SHGetSetFolderCustomSettings(
+        ref SHFOLDERCUSTOMSETTINGS pfcs,
+        string pszPath,
+        uint dwReadWrite
+    );
+
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern IntPtr FindWindowW(string? lpClassName, string? lpWindowName);
+
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern IntPtr FindWindowExW(IntPtr hWndParent, IntPtr hWndChildAfter, string? lpszClass, string? lpszWindow);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetShellWindow();
+
+    /// <summary>Flushes the Windows kernel in-memory INI cache so GetPrivateProfileString re-reads desktop.ini.</summary>
+    public static void FlushIniCache(string iniPath)
+    {
+        try
+        {
+            WritePrivateProfileStringW(null, null, null, iniPath);
+        }
+        catch (Exception ex)
+        {
+            Dbg.Log("FlushIniCache THREW: " + ex.Message);
+        }
+    }
+
     /// <summary>Asks Explorer to refresh a directory (e.g. after an icon change).</summary>
     public static void NotifyShellDirectoryChanged(string directoryPath) =>
         SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW | SHCNF_FLUSH, directoryPath, IntPtr.Zero);
 
     /// <summary>
-    /// Forces Explorer to re-read a folder's custom icon immediately. A plain
-    /// UPDATEDIR is not enough for folder-icon changes (the open view keeps
-    /// serving the stale cached icon) — the working recipe is: UPDATEIMAGE
-    /// flush + UPDATEDIR on the folder and its parent + a self-rename
-    /// notification, which evicts the cached shell item and forces a
-    /// desktop.ini re-parse in every open view.
+    /// Forces Explorer to re-read and apply a folder's custom icon IMMEDIATELY:
+    /// 1. Flushes kernel INI cache so desktop.ini changes are recognized without latency.
+    /// 2. Fires PIDL-based shell notifications (including the self-rename notification to evict cached icon handles).
+    /// 3. Flushes the system shell image list (-1).
+    /// 4. Broadcasts SHCNE_ASSOCCHANGED to invalidate shell icon caches across all Explorer processes.
+    /// 5. Uses COM automation (IShellWindows) to directly trigger window.Refresh() on any open Explorer window.
+    /// 6. Refreshes the Windows Desktop view if the target folder resides on the Desktop.
     /// </summary>
     public static void NotifyFolderIconChanged(string folderPath)
     {
         var parent = System.IO.Path.GetDirectoryName(folderPath);
 
-        UPDATEDirSafe(folderPath);
-        if (!string.IsNullOrEmpty(parent)) UPDATEDirSafe(parent);
+        // 1. Flush kernel INI cache for desktop.ini so GetPrivateProfileString immediately sees changes
+        var ini = System.IO.Path.Combine(folderPath, "desktop.ini");
+        FlushIniCache(ini);
 
-        // Flush the system image cache, then pretend the folder was renamed
-        // to itself so every view re-resolves its icon from desktop.ini.
-        SHChangeNotifyPidl(SHCNE_UPDATEIMAGE, SHCNF_IDLIST | SHCNF_FLUSH, (IntPtr)(-1), IntPtr.Zero);
-
-        var oldPidl = SHSimpleIDListFromPath(folderPath);
-        var newPidl = SHSimpleIDListFromPath(folderPath);
-        if (oldPidl != IntPtr.Zero && newPidl != IntPtr.Zero)
+        // 2. PIDL-based notifications (Explorer views prioritize PIDL updates)
+        var folderPidl = IntPtr.Zero;
+        var parentPidl = IntPtr.Zero;
+        try
         {
-            SHChangeNotifyPidl(SHCNE_RENAMEFOLDER, SHCNF_IDLIST | SHCNF_FLUSH, oldPidl, newPidl);
+            folderPidl = SHSimpleIDListFromPath(folderPath);
+            if (!string.IsNullOrEmpty(parent))
+                parentPidl = SHSimpleIDListFromPath(parent);
+
+            if (folderPidl != IntPtr.Zero)
+            {
+                SHChangeNotifyPidl(SHCNE_ATTRIBUTES, SHCNF_IDLIST | SHCNF_FLUSH, folderPidl, IntPtr.Zero);
+                SHChangeNotifyPidl(SHCNE_UPDATEITEM, SHCNF_IDLIST | SHCNF_FLUSH, folderPidl, IntPtr.Zero);
+                SHChangeNotifyPidl(SHCNE_UPDATEDIR, SHCNF_IDLIST | SHCNF_FLUSH, folderPidl, IntPtr.Zero);
+            }
+
+            if (parentPidl != IntPtr.Zero)
+            {
+                SHChangeNotifyPidl(SHCNE_UPDATEDIR, SHCNF_IDLIST | SHCNF_FLUSH, parentPidl, IntPtr.Zero);
+            }
         }
-        if (oldPidl != IntPtr.Zero) ILFree(oldPidl);
-        if (newPidl != IntPtr.Zero) ILFree(newPidl);
+        catch (Exception ex)
+        {
+            Dbg.Log("NotifyFolderIconChanged PIDL THREW: " + ex.Message);
+        }
+        finally
+        {
+            if (folderPidl != IntPtr.Zero) ILFree(folderPidl);
+            if (parentPidl != IntPtr.Zero) ILFree(parentPidl);
+        }
+
+        // 3. String-path notifications for views listening by path
+        try
+        {
+            SHChangeNotify(SHCNE_ATTRIBUTES, SHCNF_PATHW | SHCNF_FLUSH, folderPath, IntPtr.Zero);
+            SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW | SHCNF_FLUSH, folderPath, IntPtr.Zero);
+            SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW | SHCNF_FLUSH, folderPath, IntPtr.Zero);
+            if (!string.IsNullOrEmpty(parent))
+                SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW | SHCNF_FLUSH, parent, IntPtr.Zero);
+        }
+        catch (Exception ex)
+        {
+            Dbg.Log("NotifyFolderIconChanged PATH THREW: " + ex.Message);
+        }
+
+        // 4. System image list reload (-1 forces all shell image lists to reload)
+        try
+        {
+            SHChangeNotifyDword(SHCNE_UPDATEIMAGE, SHCNF_DWORD | SHCNF_FLUSH, IntPtr.Zero, new IntPtr(-1));
+        }
+        catch { }
+
+        // 5. Invalidate shell icon association cache
+        try
+        {
+            SHChangeNotifyPidl(SHCNE_ASSOCCHANGED, SHCNF_IDLIST | SHCNF_FLUSH, IntPtr.Zero, IntPtr.Zero);
+        }
+        catch { }
+
+        // 6. Direct COM automation: Refresh open Explorer windows displaying this folder or its parent
+        RefreshOpenExplorerWindows(folderPath);
+
+        // 7. Refresh desktop if the folder is on the Desktop
+        RefreshDesktopIfNecessary(folderPath);
+    }
+
+    /// <summary>
+    /// Enumerates open Windows Explorer windows via Shell.Application COM interface and
+    /// calls Refresh() on any window displaying the target folder or its parent folder.
+    /// This causes the folder's new icon to update instantaneously right in front of the user.
+    /// </summary>
+    public static void RefreshOpenExplorerWindows(string folderPath)
+    {
+        try
+        {
+            var shellType = Type.GetTypeFromProgID("Shell.Application");
+            if (shellType == null) return;
+            dynamic? shell = Activator.CreateInstance(shellType);
+            if (shell == null) return;
+
+            var parent = System.IO.Path.GetDirectoryName(folderPath);
+            var normTarget = System.IO.Path.GetFullPath(folderPath).TrimEnd('\\');
+            var normParent = !string.IsNullOrEmpty(parent) ? System.IO.Path.GetFullPath(parent).TrimEnd('\\') : null;
+
+            dynamic windows = shell.Windows();
+            int count = windows.Count;
+            for (int i = 0; i < count; i++)
+            {
+                try
+                {
+                    dynamic window = windows.Item(i);
+                    if (window == null) continue;
+
+                    string? winPath = null;
+                    try
+                    {
+                        string? url = window.LocationURL;
+                        if (!string.IsNullOrEmpty(url) && Uri.TryCreate(url, UriKind.Absolute, out var uri) && uri.IsFile)
+                        {
+                            winPath = uri.LocalPath;
+                        }
+                    }
+                    catch { }
+
+                    if (string.IsNullOrEmpty(winPath))
+                    {
+                        try { winPath = window.Document?.Folder?.Self?.Path; } catch { }
+                    }
+
+                    if (!string.IsNullOrEmpty(winPath))
+                    {
+                        winPath = System.IO.Path.GetFullPath(winPath).TrimEnd('\\');
+                        if (string.Equals(winPath, normTarget, StringComparison.OrdinalIgnoreCase) ||
+                            (normParent != null && string.Equals(winPath, normParent, StringComparison.OrdinalIgnoreCase)))
+                        {
+                            window.Refresh();
+                        }
+                    }
+                }
+                catch { }
+            }
+        }
+        catch (Exception ex)
+        {
+            Dbg.Log("RefreshOpenExplorerWindows THREW: " + ex.Message);
+        }
+    }
+
+    private static void RefreshDesktopIfNecessary(string folderPath)
+    {
+        try
+        {
+            var desktopPath = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
+            var commonDesktopPath = Environment.GetFolderPath(Environment.SpecialFolder.CommonDesktopDirectory);
+            var parent = System.IO.Path.GetDirectoryName(folderPath);
+
+            bool isOnDesktop = (!string.IsNullOrEmpty(parent) &&
+                (string.Equals(parent, desktopPath, StringComparison.OrdinalIgnoreCase) ||
+                 string.Equals(parent, commonDesktopPath, StringComparison.OrdinalIgnoreCase)));
+
+            if (isOnDesktop)
+            {
+                UPDATEDirSafe(desktopPath);
+                if (!string.IsNullOrEmpty(commonDesktopPath))
+                    UPDATEDirSafe(commonDesktopPath);
+
+                var progman = FindWindowW("Progman", null);
+                var defView = FindWindowExW(progman, IntPtr.Zero, "SHELLDLL_DefView", null);
+                if (defView == IntPtr.Zero)
+                {
+                    var shellWin = GetShellWindow();
+                    if (shellWin != IntPtr.Zero)
+                        defView = FindWindowExW(shellWin, IntPtr.Zero, "SHELLDLL_DefView", null);
+                }
+
+                if (defView == IntPtr.Zero)
+                {
+                    var workerW = IntPtr.Zero;
+                    do
+                    {
+                        workerW = FindWindowExW(IntPtr.Zero, workerW, "WorkerW", null);
+                        if (workerW != IntPtr.Zero)
+                        {
+                            defView = FindWindowExW(workerW, IntPtr.Zero, "SHELLDLL_DefView", null);
+                            if (defView != IntPtr.Zero) break;
+                        }
+                    } while (workerW != IntPtr.Zero);
+                }
+
+                if (defView != IntPtr.Zero)
+                {
+                    PostMessageW(defView, 0x0111 /* WM_COMMAND */, (IntPtr)28931 /* F5/Refresh */, IntPtr.Zero);
+                    PostMessageW(defView, 0x0111 /* WM_COMMAND */, (IntPtr)41504 /* Refresh */, IntPtr.Zero);
+                }
+            }
+        }
+        catch { }
     }
 
     private static void UPDATEDirSafe(string path)

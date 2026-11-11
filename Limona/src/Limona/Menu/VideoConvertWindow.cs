@@ -106,6 +106,14 @@ internal sealed class VideoConvertWindow : Window
     private async System.Threading.Tasks.Task PrepareAsync()
     {
         var name = Path.GetFileName(_sourcePath);
+        if (!File.Exists(_sourcePath) || new FileInfo(_sourcePath).Length == 0)
+        {
+            SetSourceInfo("Source: {0} — ⚠️ File is empty (0 bytes)", name);
+            SetStatus("Cannot convert: source file has 0 bytes.", "#FFED6A5E");
+            _convertButton.IsEnabled = false;
+            return;
+        }
+
         SetSourceInfo("Source: {0} — reading info…", name);
         try
         {
@@ -165,6 +173,13 @@ internal sealed class VideoConvertWindow : Window
     private async System.Threading.Tasks.Task OnConvertClicked()
     {
         if (_converting) return;
+
+        if (!File.Exists(_sourcePath) || new FileInfo(_sourcePath).Length == 0)
+        {
+            SetStatus("Cannot convert: source file has 0 bytes.", "#FFED6A5E");
+            return;
+        }
+
         _converting = true;
         _convertButton.IsEnabled = false;
         _formatBox.IsEnabled = false;
@@ -196,8 +211,20 @@ internal sealed class VideoConvertWindow : Window
         catch (Exception ex)
         {
             Dbg.Log("VideoConvertWindow convert THREW: " + ex);
-            var msg = ex.Message.Split('\n')[0];
-            SetStatus("✗  Conversion failed: {0}", "#FFED6A5E", msg);
+            string userMsg;
+            if (ex.Message.Contains("-1094995529") || ex.Message.Contains("moov atom not found") || ex.Message.Contains("Invalid data found"))
+            {
+                userMsg = "Video file is corrupt or incomplete (missing moov atom / invalid header).";
+            }
+            else if (ex.Message.Contains("No such file"))
+            {
+                userMsg = "Video file not found.";
+            }
+            else
+            {
+                userMsg = ex.Message.Split('\n')[0];
+            }
+            SetStatus("✗  Conversion failed: {0}", "#FFED6A5E", userMsg);
             _progressHost.Opacity = 0;
             _progressPct.Opacity = 0;
             _convertButton.IsEnabled = true;

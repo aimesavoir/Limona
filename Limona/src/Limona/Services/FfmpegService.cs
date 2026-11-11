@@ -86,6 +86,9 @@ public static class FfmpegService
             _     => ".mp4",
         };
 
+        if (!File.Exists(sourcePath) || new FileInfo(sourcePath).Length == 0)
+            throw new InvalidOperationException("The source video file is empty (0 bytes) or does not exist.");
+
         var dir = Path.GetDirectoryName(sourcePath)
                   ?? Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
         var baseName = Path.GetFileNameWithoutExtension(sourcePath);

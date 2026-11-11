@@ -558,12 +558,12 @@ public static class FolderCustomizationService
         {
             SetupGraphics(g);
 
-            // Step 1: Base icon. If folder has custom folder.ico, load it!
-            var customIco = Path.Combine(folderPath, "folder.ico");
+            // Step 1: Preserve the icon currently referenced by desktop.ini.
+            var customIco = FolderService.GetCurrentFolderIconPath(folderPath);
             var backupIco = Path.Combine(BadgeBackupsDir, $"{GetFolderHash(folderPath)}.ico");
 
             bool drewExisting = false;
-            if (File.Exists(customIco))
+            if (customIco is not null)
             {
                 try
                 {
@@ -600,7 +600,7 @@ public static class FolderCustomizationService
         return (bmp, icoBytes);
     }
 
-    public static bool RestoreOriginalBadgeIcon(string folderPath)
+    public static async Task<bool> RestoreOriginalBadgeIconAsync(string folderPath)
     {
         var backupIco = Path.Combine(BadgeBackupsDir, $"{GetFolderHash(folderPath)}.ico");
         if (File.Exists(backupIco))
@@ -608,7 +608,7 @@ public static class FolderCustomizationService
             try
             {
                 var icoBytes = File.ReadAllBytes(backupIco);
-                _ = FolderService.ApplyGeneratedIconAsync(folderPath, icoBytes);
+                await FolderService.ApplyGeneratedIconAsync(folderPath, icoBytes);
                 return true;
             }
             catch (Exception ex)

@@ -1,4 +1,6 @@
 using System.IO.Compression;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 
 namespace Limona.Services;
@@ -7,7 +9,7 @@ namespace Limona.Services;
 /// Folder-only operations backing the folder Limona:
 ///   · Compress ZIP   — zip the folder next to itself
 ///   · Size           — recursive byte/file/folder count
-///   · Change Icon    — desktop.ini + embedded folder.ico + shell notify
+///   · Change Icon    — desktop.ini + content-addressed icon file + shell notify
 /// </summary>
 public static class FolderService
 {
@@ -220,19 +222,18 @@ public static class FolderService
     }
 
     // ------------------------------------------------------------------
-    // Custom folder icon (desktop.ini + folder.ico)
+    // Custom folder icon (desktop.ini + content-addressed ICO)
     // ------------------------------------------------------------------
 
     private const string IniSection = "[.ShellClassInfo]";
 
     /// <summary>
     /// Applies a custom icon: converts any picked image to .ico when needed,
-    /// copies it into the folder as "folder.ico", writes desktop.ini, marks the
-    /// folder SYSTEM so Explorer reads it, and notifies the shell.
+    /// stores it under a content-addressed name, writes desktop.ini, enables
+    /// the shell's custom-folder attributes, and notifies Explorer.
     /// </summary>
     public static async Task SetFolderIconAsync(string folderPath, string pickedImagePath)
     {
-        var icoPath = Path.Combine(folderPath, "folder.ico");
         var ext = Path.GetExtension(pickedImagePath);
 
         byte[] iconBytes;
@@ -249,8 +250,7 @@ public static class FolderService
             try { File.Delete(converted); } catch { /* temp cleanup best-effort */ }
         }
 
-        WriteFileAtomically(icoPath, iconBytes, FileAttributes.Hidden);
-        FinishIconApply(folderPath);
+        ApplyIconBytes(folderPath, iconBytes);
         return;
     }
 
@@ -262,9 +262,7 @@ public static class FolderService
     {
         await Task.Run(() =>
         {
-            var icoPath = Path.Combine(folderPath, "folder.ico");
-            WriteFileAtomically(icoPath, icoBytes, FileAttributes.Hidden);
-            FinishIconApply(folderPath);
+            ApplyIconBytes(folderPath, icoBytes);
         });
     }
 
@@ -274,13 +272,11 @@ public static class FolderService
     /// single-size .ico) is re-rendered into a full 16…256 px ICO so the icon
     /// scales cleanly with Explorer's zoom slider.
     /// </summary>
-    public static Task ApplyGalleryIconAsync(string folderPath, string sourceFile) => Task.Run(() =>
+    public static async Task ApplyGalleryIconAsync(string folderPath, string sourceFile)
     {
-        var icoBytes = BuildIconBytesForSource(sourceFile);
-
-        var t = ApplyGeneratedIconAsync(folderPath, icoBytes);
-        t.GetAwaiter().GetResult();
-    });
+        var icoBytes = await Task.Run(() => BuildIconBytesForSource(sourceFile));
+        await ApplyGeneratedIconAsync(folderPath, icoBytes);
+    }
 
     /// <summary>
     /// Converts any gallery source (.ico, .png, .jpg, …) into a full multi-size
@@ -292,58 +288,175 @@ public static class FolderService
             ? NormalizeIcoBytes(sourceFile)
             : BuildMultiSizeIcoFromImageFile(sourceFile);
 
-    /// <summary>Shared tail: desktop.ini icon line, folder SYSTEM attr, shell refresh.</summary>
-    private static void FinishIconApply(string folderPath)
+    public static string? GetCurrentFolderIconPath(string folderPath)
     {
-        var iconRef = "folder.ico,0";
+        var iniPath = Path.Combine(folderPath, "desktop.ini");
+        if (File.Exists(iniPath))
+        {
+            try
+            {
+                foreach (var line in ReadDesktopIniLines(iniPath))
+                {
+                    var separator = line.IndexOf('=');
+                    if (separator < 0)
+                        continue;
+
+                    var key = line[..separator].Trim();
+                    if (!key.Equals("IconFile", StringComparison.OrdinalIgnoreCase) &&
+                        !key.Equals("IconResource", StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    var iconReference = line[(separator + 1)..].Trim().Trim('"');
+                    if (key.Equals("IconResource", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var indexSeparator = iconReference.LastIndexOf(',');
+                        if (indexSeparator >= 0)
+                            iconReference = iconReference[..indexSeparator].Trim().Trim('"');
+                    }
+
+                    var iconPath = Path.IsPathRooted(iconReference)
+                        ? iconReference
+                        : Path.GetFullPath(Path.Combine(folderPath, iconReference));
+                    if (File.Exists(iconPath))
+                        return iconPath;
+
+                    // Fallback if folder was moved/renamed: check by filename directly in folder
+                    var fallbackPath = Path.Combine(folderPath, Path.GetFileName(iconReference));
+                    if (File.Exists(fallbackPath))
+                        return fallbackPath;
+                }
+            }
+            catch (Exception ex)
+            {
+                Interop.Dbg.Log($"GetCurrentFolderIconPath failed for '{folderPath}': {ex.Message}");
+            }
+        }
+
+        var legacyIconPath = Path.Combine(folderPath, "folder.ico");
+        return File.Exists(legacyIconPath) ? legacyIconPath : null;
+    }
+
+    private static void ApplyIconBytes(string folderPath, byte[] iconBytes)
+    {
+        var iconFileName = $"LimonaIcon-{Convert.ToHexString(SHA256.HashData(iconBytes))}.ico";
+        var iconPath = Path.Combine(folderPath, iconFileName);
+        WriteFileAtomically(iconPath, iconBytes, FileAttributes.Hidden);
+        FinishIconApply(folderPath, iconFileName);
+    }
+
+    /// <summary>Writes the folder's icon reference using the Windows Properties API, enables shell customization, and refreshes Explorer.</summary>
+    private static void FinishIconApply(string folderPath, string iconFileName)
+    {
+        var fullIconPath = Path.Combine(folderPath, iconFileName);
+
+        // 1. Call Windows Shell's official API: the EXACT function called by Windows Explorer Properties -> Customize
+        try
+        {
+            var fcs = new Interop.Win32.SHFOLDERCUSTOMSETTINGS
+            {
+                dwSize = (uint)Marshal.SizeOf<Interop.Win32.SHFOLDERCUSTOMSETTINGS>(),
+                dwMask = Interop.Win32.FCSM_ICONFILE,
+                pszIconFile = fullIconPath,
+                cchIconFile = 0,
+                iIconIndex = 0
+            };
+            var hr = Interop.Win32.SHGetSetFolderCustomSettings(ref fcs, folderPath, Interop.Win32.FCS_FORCEWRITE);
+            Interop.Dbg.Log($"SHGetSetFolderCustomSettings returned: 0x{hr:X8}");
+        }
+        catch (Exception ex)
+        {
+            Interop.Dbg.Log("SHGetSetFolderCustomSettings THREW: " + ex.Message);
+        }
+
+        // 2. Ensure desktop.ini also carries relative IconFile and ConfirmFileOp=0 for maximum compatibility
         var ini = Path.Combine(folderPath, "desktop.ini");
-        var lines = new List<string>();
         if (File.Exists(ini))
         {
             try
             {
-                var foundShellClassInfo = false;
-                foreach (var line in ReadDesktopIniLines(ini))
+                var lines = ReadDesktopIniLines(ini).ToList();
+                var headerIdx = lines.FindIndex(l => l.Trim().Equals(IniSection, StringComparison.OrdinalIgnoreCase));
+                if (headerIdx >= 0)
                 {
-                    if (line.Trim().Equals(IniSection, StringComparison.OrdinalIgnoreCase))
+                    bool modified = false;
+                    if (!lines.Any(l => l.StartsWith("IconFile=", StringComparison.OrdinalIgnoreCase)))
                     {
-                        if (foundShellClassInfo) continue;
-                        foundShellClassInfo = true;
+                        lines.Insert(headerIdx + 1, $"IconFile={iconFileName}");
+                        modified = true;
                     }
-
-                    if (line.StartsWith("IconResource", StringComparison.OrdinalIgnoreCase) ||
-                        line.StartsWith("IconFile", StringComparison.OrdinalIgnoreCase) ||
-                        line.StartsWith("IconIndex", StringComparison.OrdinalIgnoreCase))
-                        continue;
-
-                    lines.Add(line);
+                    if (!lines.Any(l => l.StartsWith("ConfirmFileOp=", StringComparison.OrdinalIgnoreCase)))
+                    {
+                        lines.Insert(headerIdx + 1, "ConfirmFileOp=0");
+                        modified = true;
+                    }
+                    if (modified)
+                    {
+                        WriteDesktopIni(ini, lines);
+                    }
                 }
             }
-            catch { lines.Clear(); }
+            catch { }
+            Interop.Win32.FlushIniCache(ini);
         }
 
-        if (!File.Exists(ini) || lines.Count == 0)
+        // 3. Ensure folder ReadOnly and System attributes are set
+        try
         {
-            lines.Add(IniSection);
+            var folderAttrs = File.GetAttributes(folderPath);
+            File.SetAttributes(folderPath, folderAttrs | FileAttributes.ReadOnly);
         }
-        else if (!lines.Any(l => l.Trim().Equals(IniSection, StringComparison.OrdinalIgnoreCase)))
+        catch { }
+
+        try
         {
-            lines.Insert(0, IniSection);
+            Interop.Win32.PathMakeSystemFolder(folderPath);
         }
+        catch { }
 
-        var headerIdx = lines.FindIndex(l => l.Trim().Equals(IniSection, StringComparison.OrdinalIgnoreCase));
-        lines.Insert(headerIdx + 1, $"IconResource={iconRef}");
+        RemoveStaleGeneratedIcons(folderPath, iconFileName);
 
-        WriteDesktopIni(ini, lines);
-        try { File.SetAttributes(ini, FileAttributes.Hidden | FileAttributes.System); } catch { }
+        // 4. Touch directory LastWriteTimeUtc so Explorer knows directory contents changed
+        try { Directory.SetLastWriteTimeUtc(folderPath, DateTime.UtcNow); } catch { }
 
-        // Folder must carry SYSTEM so Explorer parses desktop.ini.
-        var folderAttrs = File.GetAttributes(folderPath);
-        File.SetAttributes(folderPath, folderAttrs | FileAttributes.System);
-
-        // Shell refresh: folder itself (desktop.ini re-parse) + parent listing.
+        // 5. Comprehensive Shell refresh (flushes cache, notifies PIDLs, refreshes open Explorer windows)
         Interop.Win32.NotifyFolderIconChanged(folderPath);
         Interop.Dbg.Log($"FolderService: icon applied to '{folderPath}'");
+    }
+
+    private static void RemoveStaleGeneratedIcons(string folderPath, string currentIconFileName)
+    {
+        try
+        {
+            foreach (var oldIcon in Directory.EnumerateFiles(folderPath, "LimonaIcon-*.ico"))
+            {
+                if (Path.GetFileName(oldIcon).Equals(currentIconFileName, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                try
+                {
+                    File.SetAttributes(oldIcon, FileAttributes.Normal);
+                    File.Delete(oldIcon);
+                }
+                catch (Exception ex)
+                {
+                    Interop.Dbg.Log($"FolderService: could not remove old generated icon '{oldIcon}': {ex.Message}");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Interop.Dbg.Log($"FolderService: could not enumerate old generated icons in '{folderPath}': {ex.Message}");
+        }
+    }
+
+    private static bool IsFolderIconSetting(string line)
+    {
+        var separator = line.IndexOf('=');
+        var key = (separator < 0 ? line : line[..separator]).Trim();
+        return key.Equals("IconResource", StringComparison.OrdinalIgnoreCase) ||
+               key.Equals("IconFile", StringComparison.OrdinalIgnoreCase) ||
+               key.Equals("IconIndex", StringComparison.OrdinalIgnoreCase) ||
+               key.Equals("ConfirmFileOp", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>
@@ -489,28 +602,72 @@ public static class FolderService
                 stream.Flush(flushToDisk: true);
             }
 
-            if (File.Exists(path))
-                File.SetAttributes(path, FileAttributes.Normal);
+            try
+            {
+                if (File.Exists(path))
+                    File.SetAttributes(path, FileAttributes.Normal);
 
-            File.Move(tempPath, path, overwrite: true);
-            File.SetAttributes(path, attributes);
+                File.Move(tempPath, path, overwrite: true);
+                File.SetAttributes(path, attributes);
+            }
+            catch (IOException)
+            {
+                // Fallback: If File.Move fails due to concurrent handle sharing, write directly
+                using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.ReadWrite))
+                {
+                    fs.Write(contents);
+                    fs.Flush(flushToDisk: true);
+                }
+                File.SetAttributes(path, attributes);
+            }
         }
         finally
         {
             if (File.Exists(tempPath))
             {
-                File.SetAttributes(tempPath, FileAttributes.Normal);
-                File.Delete(tempPath);
+                try
+                {
+                    File.SetAttributes(tempPath, FileAttributes.Normal);
+                    File.Delete(tempPath);
+                }
+                catch { }
             }
         }
     }
 
-    /// <summary>Removes the custom icon section from desktop.ini and deletes folder.ico.</summary>
+    /// <summary>Removes the custom icon section from desktop.ini and deletes app-managed icon files.</summary>
     public static void ResetFolderIcon(string folderPath)
     {
         try
         {
+            // 1. Call official Windows Properties reset API
+            try
+            {
+                var fcs = new Interop.Win32.SHFOLDERCUSTOMSETTINGS
+                {
+                    dwSize = (uint)Marshal.SizeOf<Interop.Win32.SHFOLDERCUSTOMSETTINGS>(),
+                    dwMask = Interop.Win32.FCSM_ICONFILE,
+                    pszIconFile = string.Empty,
+                    cchIconFile = 0,
+                    iIconIndex = 0
+                };
+                Interop.Win32.SHGetSetFolderCustomSettings(ref fcs, folderPath, Interop.Win32.FCS_FORCEWRITE);
+            }
+            catch { }
+
             try { File.Delete(Path.Combine(folderPath, "folder.ico")); } catch { }
+            foreach (var generatedIcon in Directory.EnumerateFiles(folderPath, "LimonaIcon-*.ico"))
+            {
+                try
+                {
+                    File.SetAttributes(generatedIcon, FileAttributes.Normal);
+                    File.Delete(generatedIcon);
+                }
+                catch (Exception ex)
+                {
+                    Interop.Dbg.Log($"ResetFolderIcon: could not delete '{generatedIcon}': {ex.Message}");
+                }
+            }
 
             var ini = Path.Combine(folderPath, "desktop.ini");
             if (File.Exists(ini))
@@ -525,9 +682,7 @@ public static class FolderService
                         foundShellClassInfo = true;
                     }
 
-                    if (line.StartsWith("IconResource", StringComparison.OrdinalIgnoreCase) ||
-                        line.StartsWith("IconFile", StringComparison.OrdinalIgnoreCase) ||
-                        line.StartsWith("IconIndex", StringComparison.OrdinalIgnoreCase))
+                    if (IsFolderIconSetting(line))
                         continue;
 
                     lines.Add(line);
@@ -539,12 +694,27 @@ public static class FolderService
                 {
                     File.SetAttributes(ini, FileAttributes.Normal);
                     File.Delete(ini);
+
+                    // Clear custom folder attributes (ReadOnly and System)
+                    try
+                    {
+                        var attrs = File.GetAttributes(folderPath);
+                        File.SetAttributes(folderPath, attrs & ~FileAttributes.ReadOnly & ~FileAttributes.System);
+                    }
+                    catch { }
+
+                    if (!Interop.Win32.PathUnmakeSystemFolder(folderPath))
+                        Interop.Dbg.Log($"FolderService: could not clear shell attributes for '{folderPath}'");
                 }
                 else
                 {
                     WriteDesktopIni(ini, lines);
                 }
+
+                Interop.Win32.FlushIniCache(ini);
             }
+
+            try { Directory.SetLastWriteTimeUtc(folderPath, DateTime.UtcNow); } catch { }
         }
         catch (Exception ex)
         {

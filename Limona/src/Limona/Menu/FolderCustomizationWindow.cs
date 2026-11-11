@@ -111,6 +111,7 @@ internal sealed class FolderCustomizationWindow : Window
     private Button? _librarySelectedButton;
     private bool _isPreparingIcon;
     private bool _isApplyingIcon;
+    private int _previewGeneration;
 
     public static void ShowForFile(string folderPath, FolderCustomTab tab = FolderCustomTab.Library)
     {
@@ -457,6 +458,7 @@ internal sealed class FolderCustomizationWindow : Window
 
     private void UpdatePreviewAsync()
     {
+        var generation = Interlocked.Increment(ref _previewGeneration);
         _pendingIcoBytes = null;
         _isPreparingIcon = true;
         UpdateApplyButtonState();
@@ -547,7 +549,7 @@ internal sealed class FolderCustomizationWindow : Window
             }
 
             _pendingIcoBytes = icoBytes;
-            ShowPreviewBitmap(bmp);
+            ShowPreviewBitmap(bmp, generation);
         }
         catch (Exception ex)
         {
@@ -562,7 +564,7 @@ internal sealed class FolderCustomizationWindow : Window
     }
 
     /// <summary>Encodes a preview bitmap as PNG and pushes it into both preview images.</summary>
-    private void ShowPreviewBitmap(System.Drawing.Bitmap bmp)
+    private void ShowPreviewBitmap(System.Drawing.Bitmap bmp, int generation)
     {
         byte[] bytes;
         using (var ms = new MemoryStream())
@@ -574,14 +576,27 @@ internal sealed class FolderCustomizationWindow : Window
 
         _ = Task.Run(async () =>
         {
-            var stream = await ImageConverter.BytesToWinRtStreamAsync(bytes);
-            this.DispatcherQueue.TryEnqueue(async () =>
+            try
             {
-                var img = new BitmapImage();
-                await img.SetSourceAsync(stream);
-                _previewLarge.Source = img;
-                _previewSmall.Source = img;
-            });
+                var stream = await ImageConverter.BytesToWinRtStreamAsync(bytes);
+                this.DispatcherQueue.TryEnqueue(async () =>
+                {
+                    if (generation != Volatile.Read(ref _previewGeneration))
+                        return;
+
+                    var img = new BitmapImage();
+                    await img.SetSourceAsync(stream);
+                    if (generation != Volatile.Read(ref _previewGeneration))
+                        return;
+
+                    _previewLarge.Source = img;
+                    _previewSmall.Source = img;
+                });
+            }
+            catch (Exception ex)
+            {
+                Dbg.Log("ShowPreviewBitmap THREW: " + ex);
+            }
         });
     }
 
@@ -729,6 +744,7 @@ internal sealed class FolderCustomizationWindow : Window
     /// <summary>Selects a pack icon: highlights it, renders the live preview, and stages the icon for Apply.</summary>
     private async Task SelectLibraryIconAsync(string path, Button button)
     {
+        var generation = Interlocked.Increment(ref _previewGeneration);
         _pendingIcoBytes = null;
         _isPreparingIcon = true;
         UpdateApplyButtonState();
@@ -747,8 +763,13 @@ internal sealed class FolderCustomizationWindow : Window
             LocalizationUi.SetFormattedText(_statusText, "Selected: {0}", Path.GetFileName(path));
 
             var bytes = await Task.Run(() => FolderService.BuildIconBytesForSource(path));
+            if (generation != Volatile.Read(ref _previewGeneration) ||
+                _currentTab != FolderCustomTab.Library ||
+                !string.Equals(path, _librarySelectedPath, StringComparison.OrdinalIgnoreCase))
+                return;
+
             _pendingIcoBytes = bytes;
-            ShowPreviewBitmap(LoadPreviewBitmap(path));
+            ShowPreviewBitmap(LoadPreviewBitmap(path), generation);
         }
         catch (Exception ex)
         {
@@ -757,8 +778,11 @@ internal sealed class FolderCustomizationWindow : Window
         }
         finally
         {
-            _isPreparingIcon = false;
-            UpdateApplyButtonState();
+            if (generation == Volatile.Read(ref _previewGeneration))
+            {
+                _isPreparingIcon = false;
+                UpdateApplyButtonState();
+            }
         }
     }
 
@@ -1301,9 +1325,9 @@ internal sealed class FolderCustomizationWindow : Window
         var restoreBtn = MakeButton("", "#FF222530");
         LocalizationUi.SetContent(restoreBtn, "↩️ {0}",
             LocalizationUi.Localized("Remove Badge & Restore Original Icon"));
-        restoreBtn.Click += (_, _) =>
+        restoreBtn.Click += async (_, _) =>
         {
-            var ok = FolderCustomizationService.RestoreOriginalBadgeIcon(_folderPath);
+            var ok = await FolderCustomizationService.RestoreOriginalBadgeIconAsync(_folderPath);
             LocalizationUi.SetText(_statusText, ok
                 ? "Badge removed, original icon restored ✓"
                 : "Restored to default icon ✓");
